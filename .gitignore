@@ -1,0 +1,87 @@
+# ===========================================
+# Municipal Budget Analyzer - .gitignore
+# ===========================================
+
+# ----- Python -----
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environment
+venv/
+ENV/
+env/
+.venv/
+
+# ----- IDE -----
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.project
+.pydevproject
+.settings/
+
+# ----- Data files (не грузим на git) -----
+# Excel файлы
+*.xlsx
+*.xls
+*.xlsm
+*.xlsb
+
+# Word файлы
+*.doc
+*.docx
+
+# JSON данные
+*.json
+
+# Текстовые логи
+*.txt
+
+# PDF файлы
+*.pdf
+
+# ----- Директории с данными -----
+input/
+output/
+
+# ----- Environment -----
+.env
+.env.local
+.env.*.local
+
+# ----- OS -----
+.DS_Store
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# ----- Временные файлы -----
+*.tmp
+*.temp
+*.bak
+*.log
+~$*
+
+# ----- Jupyter Notebooks -----
+.ipynb_checkpoints/
+
