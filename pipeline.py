@@ -49,8 +49,8 @@ def run_input_processing():
             json.dump(totals_data, f, ensure_ascii=False, indent=2)
         print(f"\nОбщие суммы из решений сохранены: {totals_path}")
     
-    # Фильтруем только файлы с расходами бюджета
-    budget_files = [f for f in found_files if f.file_type == 'budget_expenses']
+    # Выбираем ОДИН лучший файл бюджета для каждого МО
+    budget_files = processor.get_budget_expense_files(one_per_mo=True)
     
     return budget_files, budget_totals
 
@@ -69,7 +69,6 @@ def run_extraction(budget_files=None):
         extractor = ArticleExtractor()
         
         for file_info in budget_files:
-            # Пропускаем Word файлы пока (TODO: добавить обработку Word таблиц)
             if file_info.format == 'excel':
                 extractor.process_excel(
                     filepath=file_info.path,
@@ -77,9 +76,14 @@ def run_extraction(budget_files=None):
                     target_sheet_name=file_info.sheet_name,
                     target_header_idx=file_info.header_row
                 )
-            elif file_info.format == 'word' and file_info.details.get('has_tables'):
-                # TODO: Обработка Word таблиц
-                print(f"  [SKIP] Word таблица: {os.path.basename(file_info.path)} (пока не поддерживается)")
+            elif file_info.format == 'word':
+                # Обработка Word таблиц
+                tables_data = file_info.details.get('tables_data')
+                extractor.process_word(
+                    filepath=file_info.path,
+                    mo_name=file_info.mo_name,
+                    tables_data=tables_data
+                )
     else:
         # Старый режим - сканируем папку input/
         extractor = extract_all_articles()
