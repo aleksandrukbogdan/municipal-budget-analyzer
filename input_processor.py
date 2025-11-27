@@ -80,13 +80,18 @@ import pandas as pd
 INPUT_DIR = "input"
 TEMP_DIR = "temp_extracted"
 
-# Ключевые фразы для поиска нужных документов
-BUDGET_EXPENSES_MARKERS = [
-    "ведомственная структура расходов бюджета",
-    "ведомственная структура расходов",
-    "распределение бюджетных ассигнований по целевым статьям",
-    "распределение бюджетных ассигнований",
+# Ключевые фразы для поиска нужных документов (в порядке ПРИОРИТЕТА!)
+# Приоритет 1: Ведомственная структура расходов
+# Приоритет 2: Распределение бюджетных ассигнований
+BUDGET_EXPENSES_MARKERS_PRIORITY = [
+    ("ведомственная структура расходов бюджета", 1),
+    ("ведомственная структура расходов", 1),
+    ("распределение бюджетных ассигнований по целевым статьям", 2),
+    ("распределение бюджетных ассигнований", 2),
 ]
+
+# Для обратной совместимости
+BUDGET_EXPENSES_MARKERS = [m[0] for m in BUDGET_EXPENSES_MARKERS_PRIORITY]
 
 DECISION_MARKERS = [
     "о бюджете",
@@ -321,12 +326,14 @@ class InputProcessor:
                         if pd.notna(val):
                             text_content += " " + str(val).lower()
                 
-                # Проверяем на маркеры бюджета расходов
-                for marker in BUDGET_EXPENSES_MARKERS:
+                # Проверяем на маркеры бюджета расходов (с приоритетом!)
+                for marker, priority in BUDGET_EXPENSES_MARKERS_PRIORITY:
                     if marker in text_content:
                         file_info.file_type = 'budget_expenses'
                         file_info.sheet_name = sheet_name
                         file_info.confidence = 0.9
+                        file_info.details['marker_priority'] = priority
+                        file_info.details['marker_found'] = marker
                         
                         # Ищем строку заголовка
                         for idx, row in df.iterrows():
@@ -335,7 +342,7 @@ class InputProcessor:
                                 file_info.header_row = idx
                                 break
                         
-                        safe_print(f"  [OK] BUDGET_EXPENSES: {os.path.basename(file_info.path)} (лист: {sheet_name})")
+                        safe_print(f"  [OK] BUDGET_EXPENSES (P{priority}): {os.path.basename(file_info.path)} (лист: {sheet_name})")
                         return
                 
                 # Проверяем на маркеры решения (редко в Excel, но возможно)
@@ -407,14 +414,19 @@ class InputProcessor:
                     safe_print(f"  [OK] DECISION: {os.path.basename(file_info.path)}")
                     return
         
-        # Проверяем маркеры бюджета расходов (приоритет для файлов с "прил" в имени)
-        for marker in BUDGET_EXPENSES_MARKERS:
+        # Проверяем маркеры бюджета расходов (с приоритетом!)
+        for marker, priority in BUDGET_EXPENSES_MARKERS_PRIORITY:
             if marker in text_lower:
                 file_info.file_type = 'budget_expenses'
                 file_info.confidence = 0.9
                 file_info.details['has_tables'] = len(tables) > 0
                 file_info.details['tables_count'] = len(tables)
-                safe_print(f"  [OK] BUDGET_EXPENSES (Word): {os.path.basename(file_info.path)}")
+                file_info.details['marker_priority'] = priority
+                file_info.details['marker_found'] = marker
+                # Сохраняем таблицы для последующей обработки в extract_articles
+                if tables:
+                    file_info.details['tables_data'] = self._convert_tables_to_dataframes(tables)
+                safe_print(f"  [OK] BUDGET_EXPENSES (Word, P{priority}): {os.path.basename(file_info.path)}")
                 return
         
         # Проверяем наличие таблицы с бюджетными данными (для приложений)
@@ -430,6 +442,9 @@ class InputProcessor:
                         file_info.details['has_tables'] = True
                         file_info.details['tables_count'] = len(tables)
                         file_info.details['source'] = 'word_table'
+                        file_info.details['marker_priority'] = 2  # Приоритет 2 для Word таблиц без явного маркера
+                        # Сохраняем таблицы для последующей обработки
+                        file_info.details['tables_data'] = self._convert_tables_to_dataframes(tables)
                         safe_print(f"  [OK] BUDGET_EXPENSES (Word таблица): {os.path.basename(file_info.path)}")
                         return
         
@@ -483,6 +498,27 @@ class InputProcessor:
                 file_info.confidence = 0.8
                 safe_print(f"  [OK] BUDGET_EXPENSES (PDF): {os.path.basename(file_info.path)}")
                 return
+    
+    def _convert_tables_to_dataframes(self, tables: List[List[List[str]]]) -> List:
+        """
+        Конвертирует таблицы из списков в DataFrame.
+        
+        Args:
+            tables: Список таблиц в формате [[[cell, cell], [cell, cell]], ...]
+        
+        Returns:
+            Список DataFrame
+        """
+        import pandas as pd
+        result = []
+        for table in tables:
+            if table and len(table) > 0:
+                try:
+                    df = pd.DataFrame(table)
+                    result.append(df)
+                except Exception:
+                    pass
+        return result
     
     def _extract_text_from_word(self, filepath: str, with_tables: bool = False) -> tuple:
         """
@@ -710,9 +746,48 @@ class InputProcessor:
         for mo, totals in self.budget_totals.items():
             safe_print(f"  - {mo}: доходы={totals.total_income}, расходы={totals.total_expenses}")
     
-    def get_budget_expense_files(self) -> List[FileInfo]:
-        """Возвращает только файлы с расходами бюджета."""
-        return [f for f in self.found_files if f.file_type == 'budget_expenses']
+    def get_budget_expense_files(self, one_per_mo: bool = True) -> List[FileInfo]:
+        """
+        Возвращает файлы с расходами бюджета.
+        
+        Args:
+            one_per_mo: Если True - возвращает только ОДИН лучший файл для каждого МО
+                        по приоритету маркеров (Ведомственная структура > Распределение ассигнований)
+        """
+        all_budget_files = [f for f in self.found_files if f.file_type == 'budget_expenses']
+        
+        if not one_per_mo:
+            return all_budget_files
+        
+        # Выбираем лучший файл для каждого МО
+        best_by_mo = {}
+        
+        for f in all_budget_files:
+            mo = f.mo_name
+            priority = f.details.get('marker_priority', 99)  # 99 = низкий приоритет
+            
+            if mo not in best_by_mo:
+                best_by_mo[mo] = f
+            else:
+                current_best = best_by_mo[mo]
+                current_priority = current_best.details.get('marker_priority', 99)
+                
+                # Меньший номер приоритета = лучше (1 лучше чем 2)
+                if priority < current_priority:
+                    safe_print(f"  [INFO] {mo}: заменяем {os.path.basename(current_best.path)} на {os.path.basename(f.path)} (приоритет {priority} < {current_priority})")
+                    best_by_mo[mo] = f
+                elif priority == current_priority:
+                    # При равном приоритете предпочитаем Excel над Word
+                    if f.format == 'excel' and current_best.format == 'word':
+                        safe_print(f"  [INFO] {mo}: предпочитаем Excel {os.path.basename(f.path)}")
+                        best_by_mo[mo] = f
+        
+        result = list(best_by_mo.values())
+        
+        if len(result) < len(all_budget_files):
+            safe_print(f"\n  Выбрано {len(result)} файлов бюджета (по одному на МО) из {len(all_budget_files)} найденных")
+        
+        return result
     
     def get_decision_files(self) -> List[FileInfo]:
         """Возвращает только файлы решений."""

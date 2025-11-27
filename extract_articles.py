@@ -282,6 +282,194 @@ class ArticleExtractor:
         except Exception as e:
             print(f"Ошибка обработки {filename}: {e}")
 
+    def process_word(self, filepath, mo_name, tables_data=None):
+        """
+        Обрабатывает Word файл с таблицами бюджета.
+        
+        Args:
+            filepath: путь к файлу
+            mo_name: название МО
+            tables_data: список таблиц (DataFrames) из input_processor, если уже извлечены
+        """
+        filename = os.path.basename(filepath)
+        print(f"Обработка Word: {filename} (МО: {mo_name})")
+        
+        try:
+            # Если таблицы не переданы - извлекаем из файла
+            if tables_data is None:
+                tables_data = self._extract_word_tables(filepath)
+            
+            if not tables_data:
+                print(f"  Таблицы не найдены в {filename}")
+                return
+            
+            # Ищем таблицу с бюджетом
+            for table_idx, df in enumerate(tables_data):
+                if df is None or df.empty:
+                    continue
+                
+                # Конвертируем все значения в строки для поиска
+                text_content = ' '.join([str(x).lower() for x in df.values.flatten() if pd.notna(x)])
+                
+                # Проверяем, есть ли маркеры бюджета
+                has_budget_markers = any(marker in text_content for marker in [
+                    'ведомственная структура',
+                    'распределение бюджетных ассигнований',
+                    'наименование'
+                ])
+                
+                # Проверяем наличие кодов разделов (0100, 0200, ...)
+                has_codes = bool(re.search(r'\b0[1-9]00\b', text_content))
+                
+                if has_budget_markers or has_codes:
+                    # Ищем строку заголовка
+                    header_row = self._find_header_row(df)
+                    
+                    if header_row is not None:
+                        print(f"  Найдена таблица {table_idx + 1}: {len(df)} строк, заголовок в строке {header_row}")
+                        self._process_dataframe(df, filepath, mo_name, header_row)
+                        return  # Обрабатываем только первую подходящую таблицу
+            
+            print(f"  Подходящая таблица бюджета не найдена в {filename}")
+            
+        except Exception as e:
+            print(f"Ошибка обработки Word {filename}: {e}")
+    
+    def _extract_word_tables(self, filepath):
+        """Извлекает таблицы из Word файла."""
+        tables = []
+        ext = os.path.splitext(filepath)[1].lower()
+        
+        try:
+            if ext == '.docx':
+                from docx import Document
+                doc = Document(filepath)
+                for table in doc.tables:
+                    data = [[cell.text.strip() for cell in row.cells] for row in table.rows]
+                    if data:
+                        df = pd.DataFrame(data)
+                        tables.append(df)
+            elif ext == '.doc':
+                # Используем win32com для старых .doc файлов
+                import win32com.client as wc
+                word = None
+                try:
+                    word = wc.gencache.EnsureDispatch('Word.Application')
+                    word.Visible = False
+                    doc = word.Documents.Open(os.path.abspath(filepath))
+                    
+                    for table in doc.Tables:
+                        rows = table.Rows.Count
+                        cols = table.Columns.Count
+                        data = []
+                        for i in range(1, rows + 1):
+                            row_data = []
+                            for j in range(1, cols + 1):
+                                try:
+                                    cell_text = table.Cell(i, j).Range.Text.strip().replace('\r\x07', '').replace('\x07', '')
+                                    row_data.append(cell_text)
+                                except:
+                                    row_data.append('')
+                            data.append(row_data)
+                        if data:
+                            df = pd.DataFrame(data)
+                            tables.append(df)
+                    
+                    doc.Close(False)
+                except Exception as e:
+                    print(f"  Ошибка чтения .doc: {e}")
+                finally:
+                    if word:
+                        try:
+                            word.Quit()
+                        except:
+                            pass
+        except Exception as e:
+            print(f"  Ошибка извлечения таблиц: {e}")
+        
+        return tables
+    
+    def _find_header_row(self, df):
+        """Находит строку заголовка в таблице."""
+        for idx in range(min(15, len(df))):
+            row_text = ' '.join([str(x).lower() for x in df.iloc[idx] if pd.notna(x)])
+            if 'наименование' in row_text and ('раздел' in row_text or 'код' in row_text):
+                return idx
+        return None
+    
+    def _process_dataframe(self, df, filepath, mo_name, header_row_idx):
+        """Обрабатывает DataFrame из Word таблицы."""
+        filename = os.path.basename(filepath)
+        
+        # Идентифицируем колонки
+        cols = self.identify_columns(df, header_row_idx)
+        
+        if cols['name'] is None:
+            print(f"  Не найдена колонка 'наименование'")
+            return
+        
+        if not cols['year_map']:
+            print(f"  Не найдены колонки с годами")
+            return
+        
+        # Обрабатываем строки данных
+        data_start = header_row_idx + 1
+        article_count = 0
+        
+        for idx in range(data_start, len(df)):
+            row = df.iloc[idx]
+            
+            # Получаем значения
+            name = row.iloc[cols['name']] if cols['name'] is not None else ""
+            
+            if pd.isna(name) or str(name).strip() == "":
+                continue
+            
+            name = str(name).strip()
+            
+            # Пропускаем итоговые строки
+            name_lower = name.lower()
+            if name_lower.startswith('итого') or name_lower.startswith('всего'):
+                continue
+            
+            # Коды разделов
+            rz = row.iloc[cols['rz']] if cols['rz'] is not None else ""
+            pr = row.iloc[cols['pr']] if cols['pr'] is not None else ""
+            csr = row.iloc[cols['csr']] if cols['csr'] is not None else ""
+            vr = row.iloc[cols['vr']] if cols['vr'] is not None else ""
+            
+            # Суммы по годам
+            row_sums = {}
+            for year, col_idx in cols['year_map'].items():
+                try:
+                    val = row.iloc[col_idx]
+                    if pd.notna(val):
+                        val_str = str(val).replace(' ', '').replace(',', '.').strip()
+                        row_sums[year] = float(val_str) if val_str else 0
+                except (ValueError, IndexError):
+                    pass
+            
+            # Пропускаем строки без сумм
+            if not row_sums or all(v == 0 for v in row_sums.values()):
+                continue
+            
+            article = {
+                "mo": mo_name,
+                "file": filename,
+                "row_idx": idx,
+                "rz": str(rz) if pd.notna(rz) else "",
+                "pr": str(pr) if pd.notna(pr) else "",
+                "csr": str(csr) if pd.notna(csr) else "",
+                "vr": str(vr) if pd.notna(vr) else "",
+                "name": name,
+                "sums": row_sums
+            }
+            
+            self.articles.append(article)
+            article_count += 1
+        
+        print(f"  Извлечено {article_count} статей из Word таблицы")
+
     def get_articles(self):
         """Возвращает список извлеченных статей."""
         return self.articles
