@@ -39,11 +39,21 @@
 """
 
 import os
+import json
 import pandas as pd
 import openpyxl
 from openpyxl.styles import Font, Alignment, Border, Side, PatternFill, NamedStyle
 from openpyxl.utils import get_column_letter
 from openpyxl.utils.dataframe import dataframe_to_rows
+
+
+def load_budget_totals_from_decisions():
+    """Загружает общие суммы бюджетов из решений."""
+    totals_file = "output/budget_totals_from_decisions.json"
+    if os.path.exists(totals_file):
+        with open(totals_file, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    return {}
 
 
 # Категории расходов (из нашей классификации)
@@ -82,16 +92,23 @@ def load_budget_data(input_file=None):
     return df
 
 
-def prepare_summary_data(df):
+def prepare_summary_data(df, budget_totals=None):
     """
     Подготавливает сводные данные по МО и категориям.
     Года определяются динамически из данных.
     Все МО присутствуют на всех листах (с пустыми значениями если данных нет).
     
+    Args:
+        df: DataFrame с капитальными расходами
+        budget_totals: dict с общими суммами из решений {МО: {total_expenses, total_income, year}}
+    
     Returns:
         dict: {year: DataFrame с данными по МО}
         list: список всех годов
     """
+    if budget_totals is None:
+        budget_totals = load_budget_totals_from_decisions()
+    
     # Определяем колонки с годами (динамически!)
     year_cols = []
     for c in df.columns:
@@ -113,9 +130,15 @@ def prepare_summary_data(df):
     
     print(f"Найдены года (динамически): {year_cols}")
     
-    # Собираем ВСЕ уникальные МО из данных
-    all_mo = sorted(df['МО'].unique().tolist())
+    # Собираем ВСЕ уникальные МО из данных И из решений
+    all_mo = set(df['МО'].unique().tolist())
+    all_mo.update(budget_totals.keys())
+    all_mo = sorted(list(all_mo))
     print(f"Найдено МО: {len(all_mo)}")
+    
+    # Выводим доступные общие суммы
+    if budget_totals:
+        print(f"Общие суммы из решений загружены для: {list(budget_totals.keys())}")
     
     result = {}
     
@@ -147,10 +170,23 @@ def prepare_summary_data(df):
         # Упорядочиваем категории
         pivot = pivot[EXPENSE_CATEGORIES]
         
-        # Добавляем итого расходов
-        pivot['Расходы_Всего'] = pivot[EXPENSE_CATEGORIES].sum(axis=1)
+        # Добавляем итого капитальных расходов (сумма по категориям)
+        pivot['Капитальные_Всего'] = pivot[EXPENSE_CATEGORIES].sum(axis=1)
         
-        # Рассчитываем проценты (защита от деления на 0)
+        # Добавляем общие расходы из решений
+        pivot['Расходы_Всего'] = 0.0
+        pivot['Доходы_Всего'] = 0.0
+        
+        for mo in pivot.index:
+            if mo in budget_totals:
+                bt = budget_totals[mo]
+                # Проверяем год из решения
+                bt_year = bt.get('year')
+                if bt_year is None or bt_year == year:
+                    pivot.at[mo, 'Расходы_Всего'] = bt.get('total_expenses', 0) or 0
+                    pivot.at[mo, 'Доходы_Всего'] = bt.get('total_income', 0) or 0
+        
+        # Рассчитываем проценты ОТ ОБЩИХ РАСХОДОВ (из решения)
         for cat in EXPENSE_CATEGORIES:
             pct_col = f'{cat}_%'
             pivot[pct_col] = pivot.apply(
@@ -159,7 +195,11 @@ def prepare_summary_data(df):
             )
         
         result[year] = pivot.reset_index()
-        print(f"  {year}: {len(pivot)} МО, сумма: {pivot['Расходы_Всего'].sum():,.0f}")
+        
+        # Выводим сводку
+        total_capital = pivot['Капитальные_Всего'].sum()
+        total_budget = pivot['Расходы_Всего'].sum()
+        print(f"  {year}: {len(pivot)} МО, капитальные: {total_capital:,.0f}, общие расходы: {total_budget:,.0f}")
     
     return result, year_cols
 
@@ -306,14 +346,15 @@ def create_year_sheet(ws, data_df, year):
         ws.cell(row=row_num, column=4, value=0)  # Доходы на чел.
         ws.cell(row=row_num, column=5, value=0)  # Расходы на чел.
         
-        # Доходы (заглушки)
-        ws.cell(row=row_num, column=6, value=0)  # Всего
-        ws.cell(row=row_num, column=7, value=0)  # Безвозмездные
+        # Доходы - из решений
+        total_income = row_data.get('Доходы_Всего', 0)
+        ws.cell(row=row_num, column=6, value=total_income)  # Всего
+        ws.cell(row=row_num, column=7, value=0)  # Безвозмездные (заглушка)
         ws.cell(row=row_num, column=8, value=0)  # %
-        ws.cell(row=row_num, column=9, value=0)  # Налоговые
+        ws.cell(row=row_num, column=9, value=0)  # Налоговые (заглушка)
         ws.cell(row=row_num, column=10, value=0)  # %
         
-        # Расходы - данные из нашей таблицы
+        # Расходы Всего - из решений (НЕ сумма капитальных!)
         total_expenses = row_data.get('Расходы_Всего', 0)
         ws.cell(row=row_num, column=11, value=total_expenses)
         
@@ -538,9 +579,14 @@ def create_dynamics_sheet(ws, all_data, years):
     ws.column_dimensions[get_column_letter(len(years) + 4)].width = 10
 
 
-def create_summary_report(input_file=None, output_file=None):
+def create_summary_report(input_file=None, output_file=None, budget_totals=None):
     """
     Создаёт сводный отчёт с несколькими листами.
+    
+    Args:
+        input_file: Путь к файлу с капитальными расходами
+        output_file: Путь для сохранения отчёта
+        budget_totals: Общие суммы из решений (если None - загрузит из файла)
     """
     if output_file is None:
         output_file = "output/Сводный_Отчет_Бюджет.xlsx"
@@ -552,8 +598,12 @@ def create_summary_report(input_file=None, output_file=None):
     
     print(f"Загружено строк: {len(df)}")
     
+    # Загружаем общие суммы из решений
+    if budget_totals is None:
+        budget_totals = load_budget_totals_from_decisions()
+    
     # Подготавливаем сводные данные
-    all_data, years = prepare_summary_data(df)
+    all_data, years = prepare_summary_data(df, budget_totals)
     
     if not all_data:
         print("Нет данных для отчёта!")
@@ -593,9 +643,13 @@ def create_summary_report(input_file=None, output_file=None):
     print("\nСводка по данным:")
     for year in years:
         if year in all_data:
-            total = all_data[year]['Расходы_Всего'].sum()
-            mo_count = len(all_data[year])
-            print(f"  {year}: {mo_count} МО, итого расходов: {total:,.2f} тыс.руб.")
+            df_year = all_data[year]
+            total_capital = df_year['Капитальные_Всего'].sum()
+            total_budget = df_year['Расходы_Всего'].sum()
+            mo_count = len(df_year)
+            print(f"  {year}: {mo_count} МО")
+            print(f"       Капитальные расходы: {total_capital:,.2f} руб.")
+            print(f"       Общие расходы (из решений): {total_budget:,.2f} руб.")
 
 
 if __name__ == "__main__":

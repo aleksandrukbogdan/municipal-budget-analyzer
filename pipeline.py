@@ -2,7 +2,8 @@
 Главный пайплайн обработки бюджетных данных.
 
 Этапы:
-1. Извлечение всех статей из Excel файлов
+0. Обработка входных данных (архивы, поиск нужных файлов, извлечение общих сумм)
+1. Извлечение всех статей из Excel/Word файлов
 2. Классификация через LLM (капитальные/не капитальные)
 3. Подсчёт сумм и формирование сводных документов
 
@@ -19,15 +20,69 @@ import json
 from datetime import datetime
 
 
-def run_extraction():
-    """Этап 1: Извлечение статей из Excel."""
+def run_input_processing():
+    """Этап 0: Обработка входных данных (архивы, поиск файлов, извлечение общих сумм)."""
+    print("\n" + "=" * 60)
+    print("ЭТАП 0: ОБРАБОТКА ВХОДНЫХ ДАННЫХ")
+    print("=" * 60)
+    
+    from input_processor import InputProcessor
+    
+    processor = InputProcessor()
+    found_files, budget_totals = processor.process_all()
+    
+    # Сохраняем общие суммы бюджетов
+    if budget_totals:
+        totals_path = "output/budget_totals_from_decisions.json"
+        os.makedirs(os.path.dirname(totals_path), exist_ok=True)
+        
+        totals_data = {}
+        for mo, bt in budget_totals.items():
+            totals_data[mo] = {
+                'year': bt.year,
+                'total_income': bt.total_income,
+                'total_expenses': bt.total_expenses,
+                'source_file': bt.source_file
+            }
+        
+        with open(totals_path, 'w', encoding='utf-8') as f:
+            json.dump(totals_data, f, ensure_ascii=False, indent=2)
+        print(f"\nОбщие суммы из решений сохранены: {totals_path}")
+    
+    # Фильтруем только файлы с расходами бюджета
+    budget_files = [f for f in found_files if f.file_type == 'budget_expenses']
+    
+    return budget_files, budget_totals
+
+
+def run_extraction(budget_files=None):
+    """Этап 1: Извлечение статей из Excel/Word файлов."""
     print("\n" + "=" * 60)
     print("ЭТАП 1: ИЗВЛЕЧЕНИЕ СТАТЕЙ")
     print("=" * 60)
     
-    from extract_articles import extract_all_articles
+    from extract_articles import extract_all_articles, ArticleExtractor
     
-    extractor = extract_all_articles()
+    if budget_files:
+        # Используем файлы от input_processor
+        print(f"Обработка {len(budget_files)} файлов от input_processor...")
+        extractor = ArticleExtractor()
+        
+        for file_info in budget_files:
+            # Пропускаем Word файлы пока (TODO: добавить обработку Word таблиц)
+            if file_info.format == 'excel':
+                extractor.process_excel(
+                    filepath=file_info.path,
+                    mo_name=file_info.mo_name,
+                    target_sheet_name=file_info.sheet_name,
+                    target_header_idx=file_info.header_row
+                )
+            elif file_info.format == 'word' and file_info.details.get('has_tables'):
+                # TODO: Обработка Word таблиц
+                print(f"  [SKIP] Word таблица: {os.path.basename(file_info.path)} (пока не поддерживается)")
+    else:
+        # Старый режим - сканируем папку input/
+        extractor = extract_all_articles()
     
     if extractor.articles:
         output_path = extractor.save_articles_json()
@@ -238,6 +293,12 @@ def main():
         help='Не создавать сводный отчёт'
     )
     
+    parser.add_argument(
+        '--skip-input-processing',
+        action='store_true',
+        help='Пропустить обработку входных данных (использовать старый режим сканирования)'
+    )
+    
     args = parser.parse_args()
     
     print("=" * 60)
@@ -247,10 +308,16 @@ def main():
     
     articles = None
     years = None
+    budget_files = None
+    budget_totals = None
+    
+    # Этап 0: Обработка входных данных
+    if not args.from_classified and not args.skip_input_processing:
+        budget_files, budget_totals = run_input_processing()
     
     # Этап 1: Извлечение
     if not args.from_classified:
-        output_path, articles, years = run_extraction()
+        output_path, articles, years = run_extraction(budget_files)
         
         if not articles:
             print("\nПайплайн остановлен: нет данных для обработки.")
@@ -288,11 +355,18 @@ def main():
     print("ПАЙПЛАЙН ЗАВЕРШЁН УСПЕШНО")
     print("=" * 60)
     print("\nВыходные файлы:")
-    print("  output/extracted_articles.json      - все извлечённые статьи")
-    print("  output/classified_articles.json     - классифицированные статьи")
-    print("  output/llm_classification_log.txt   - лог LLM классификации")
-    print("  output/budget_capital_expenses.xlsx - детальные данные")
-    print("  output/budget_totals.json           - итоговые суммы")
+    print("  output/budget_totals_from_decisions.json - общие суммы из решений")
+    print("  output/extracted_articles.json           - все извлечённые статьи")
+    print("  output/classified_articles.json          - классифицированные статьи")
+    print("  output/llm_classification_log.txt        - лог LLM классификации")
+    print("  output/budget_capital_expenses.xlsx      - детальные данные")
+    print("  output/budget_totals.json                - итоговые суммы по капитальным расходам")
+    
+    # Выводим общие суммы из решений
+    if budget_totals:
+        print("\nОбщие суммы бюджетов (из решений):")
+        for mo, bt in budget_totals.items():
+            print(f"  {mo}: доходы={bt.total_income:,.2f}, расходы={bt.total_expenses:,.2f}")
     
     return 0
 

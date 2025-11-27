@@ -132,7 +132,5 @@ python pipeline.py --help
 - requests, python-dotenv
 - LLM сервер (vLLM) для режима с LLM
 
-## Лицензия
 
-Внутренний проект
 
