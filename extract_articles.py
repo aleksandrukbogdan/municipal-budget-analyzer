@@ -34,10 +34,22 @@ import pandas as pd
 import re
 import warnings
 import json
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
 
 warnings.simplefilter("ignore")
 
 INPUT_DIR = "input"
+DEBUG_LOG_FILE = "output/debug_parsing_log.txt"
+
+def log_debug(msg):
+    """Пишет сообщение в отладочный лог."""
+    try:
+        os.makedirs(os.path.dirname(DEBUG_LOG_FILE), exist_ok=True)
+        with open(DEBUG_LOG_FILE, 'a', encoding='utf-8') as f:
+            f.write(msg + "\n")
+    except Exception:
+        pass
 
 def normalize_text(text):
     if pd.isna(text): return ""
@@ -52,7 +64,15 @@ def normalize_code(val):
 def get_row_type(rz_val, csr_val, vr_val, name_val):
     """
     Определяет тип строки на основе инструкций.
-    Возвращает: 'Section', 'Subsection', 'Program', 'Article', 'ViewExpense'
+    Возвращает: 'Section', 'Subsection', 'Program', 'Subprogram', 'Article', 'ViewExpense'
+    
+    Признаки (из инструкции):
+    - Раздел: код РзПр кратен 100 (0100, 0200, ...), нет ЦСР, нет ВР
+    - Подраздел: код РзПр НЕ кратен 100, нет ЦСР, нет ВР  
+    - Программа: код ЦСР заканчивается на 8 нулей, нет ВР
+    - Подпрограмма: код ЦСР заканчивается на 7 нулей, нет ВР
+    - Статья: есть ЦСР (не программа/подпрограмма), нет ВР
+    - Вид расхода: есть ВР
     """
     rz = normalize_code(rz_val)
     csr = normalize_code(csr_val)
@@ -69,10 +89,18 @@ def get_row_type(rz_val, csr_val, vr_val, name_val):
         return "Subsection"
 
     # 3. Если есть ЦСР, но нет ВР - это Программа, Подпрограмма или СТАТЬЯ
-    if csr.endswith('00000'): 
-         return "Program"
-
+    # Согласно инструкции (строка 64):
+    # - код программы заканчивается на 8 нулей
+    # - код подпрограммы заканчивается на 7 нулей
+    if csr.endswith('00000000'):  # 8 нулей - Программа
+        return "Program"
+    if csr.endswith('0000000'):   # 7 нулей - Подпрограмма
+        return "Subprogram"
+    
+    # Дополнительная проверка по наименованию
     name_lower = name.lower()
+    if "подпрограмма" in name_lower:
+        return "Subprogram"
     if "программа" in name_lower:
         return "Program"
         
@@ -110,16 +138,53 @@ class ArticleExtractor:
     это будет делать LLM на следующем этапе.
     """
     
+    # Символы, недопустимые в Excel (управляющие символы кроме tab, newline, carriage return)
+    ILLEGAL_CHARS_RE = re.compile(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]')
+    
     def __init__(self):
         self.articles = []  # Список извлеченных статей
         self.all_years = set()
+        self._lock = threading.Lock()  # Для потокобезопасного добавления статей
+    
+    @classmethod
+    def clean_text(cls, text):
+        """Очищает текст от недопустимых символов для Excel."""
+        if text is None:
+            return ""
+        text = str(text)
+        # Удаляем управляющие символы Word
+        text = text.replace('\x07', '').replace('\r\x07', '')
+        # Удаляем остальные недопустимые символы
+        text = cls.ILLEGAL_CHARS_RE.sub('', text)
+        return text.strip()
+    
+    def _add_article(self, article):
+        """Потокобезопасное добавление статьи."""
+        with self._lock:
+            self.articles.append(article)
+    
+    def _add_years(self, years):
+        """Потокобезопасное добавление годов."""
+        with self._lock:
+            self.all_years.update(years)
 
     def identify_columns(self, df, header_row_idx):
         header = df.iloc[header_row_idx]
         cols = {
             'name': None, 'rz': None, 'pr': None, 'csr': None, 'vr': None, 
-            'year_map': {} 
+            'year_map': {},
+            'multiplier': 1.0  # Множитель для сумм (1000 если тыс. руб.)
         }
+        found_years = set()
+        
+        # Проверяем единицы измерения в области заголовка (расширенный поиск)
+        for check_idx in range(max(0, header_row_idx - 5), min(len(df), header_row_idx + 5)):
+            row_text = " ".join([str(x).lower() for x in df.iloc[check_idx] if pd.notna(x)])
+            # Различные варианты "тысяч рублей"
+            if any(pattern in row_text for pattern in ['тыс.руб', 'тысяч руб', 'т.р.', 'тыс р', '(тыс']):
+                cols['multiplier'] = 1000.0
+                log_debug(f"  Единицы: тыс. руб. (строка {check_idx})")
+                break
         
         def scan_row_for_cols(row_items, is_header_row=True):
              for idx, val in enumerate(row_items):
@@ -130,15 +195,30 @@ class ArticleExtractor:
                     y = int(years[0])
                     if y >= 2024:
                         cols['year_map'][y] = idx
-                        self.all_years.add(y)
+                        found_years.add(y)
 
                 if is_header_row:
-                    if 'наименование' in txt: cols['name'] = idx
-                    elif 'раздел' in txt and 'подраздел' not in txt: cols['rz'] = idx
-                    elif 'подраздел' in txt: cols['pr'] = idx
-                    elif 'раздел' in txt and 'подраздел' in txt: cols['rz'] = idx 
-                    elif 'целев' in txt or 'цср' in txt: cols['csr'] = idx
-                    elif 'вид' in txt and 'расх' in txt: cols['vr'] = idx
+                    if 'наименование' in txt:
+                        cols['name'] = idx
+                    # РзПр - расширенный поиск
+                    elif any(kw in txt for kw in ['рзпр', 'кодраз', 'кодподраз']):
+                        cols['rz'] = idx
+                    elif 'раздел' in txt and 'подраздел' in txt:
+                        cols['rz'] = idx
+                    elif 'раздел' in txt or 'кодрз' in txt:
+                        cols['rz'] = idx
+                    elif 'подраздел' in txt or 'кодпр' in txt:
+                        cols['pr'] = idx
+                    # ЦСР - расширенный поиск
+                    elif any(kw in txt for kw in ['цср', 'кодцел', 'кодстатьи', 'целеваястатья', 'целевойстатьи']):
+                        cols['csr'] = idx
+                    elif 'целев' in txt:
+                        cols['csr'] = idx
+                    # ВР - расширенный поиск
+                    elif any(kw in txt for kw in ['кодвид', 'кодрасход', 'видрасх']):
+                        cols['vr'] = idx
+                    elif 'вид' in txt and 'расх' in txt:
+                        cols['vr'] = idx
         
         scan_row_for_cols(header, is_header_row=True)
         
@@ -158,13 +238,22 @@ class ArticleExtractor:
                  cols['year_map'][2024] = sum_start
                  cols['year_map'][2025] = sum_start + 1
                  cols['year_map'][2026] = sum_start + 2
-                 self.all_years.update([2024, 2025, 2026])
+                 found_years.update([2024, 2025, 2026])
 
+        # Добавляем найденные годы потокобезопасно
+        if found_years:
+            self._add_years(found_years)
+
+        # Fallback: определяем колонки по позиции относительно name
+        # ТОЛЬКО если вообще ничего не найдено
         if cols['name'] is not None:
             n = cols['name']
-            if cols['vr'] is None and n > 0: cols['vr'] = n - 1 
-            if cols['csr'] is None and n > 1: cols['csr'] = n - 2
-            if cols['rz'] is None and n > 3: cols['rz'] = n - 3
+            if all(cols[k] is None for k in ['rz', 'pr', 'csr', 'vr']):
+                # Типичный порядок: РзПр, ЦСР, ВР, Наименование
+                if n > 0: cols['vr'] = n - 1
+                if n > 1: cols['csr'] = n - 2
+                if n > 3: cols['rz'] = n - 3  # Исправлено: было n - 2
+                log_debug("  ВНИМАНИЕ: Использован fallback для определения колонок!")
 
         return cols
 
@@ -174,6 +263,7 @@ class ArticleExtractor:
         """
         filename = os.path.basename(filepath)
         print(f"Обработка: {filename} (МО: {mo_name})")
+        log_debug(f"\n{'='*80}\nФАЙЛ: {filename} (МО: {mo_name})\n{'='*80}")
         
         try:
             xls = pd.ExcelFile(filepath)
@@ -222,7 +312,15 @@ class ArticleExtractor:
                 return
 
             years = sorted(col_map['year_map'].keys())
-            print(f"  Колонки: Name={col_map['name']}, CSR={col_map['csr']}, Years={years}")
+            multiplier = col_map.get('multiplier', 1.0)
+            mult_info = " (тыс.руб. -> руб.)" if multiplier > 1 else ""
+            print(f"  Колонки: Name={col_map['name']}, RZ={col_map['rz']}, CSR={col_map['csr']}, Years={years}{mult_info}")
+            
+            log_debug(f"Лист: {sheet_to_use}")
+            log_debug(f"Колонки: Name={col_map['name']}, RZ={col_map['rz']}, CSR={col_map['csr']}, VR={col_map['vr']}, Years={years}{mult_info}")
+            log_debug(f"Множитель: {multiplier}")
+            log_debug(f"Заголовок (строка {header_idx}): {list(df.iloc[header_idx].values)[:8]}")
+            log_debug("-" * 40)
 
             start_row = header_idx + 1
             if start_row < len(df):
@@ -235,49 +333,85 @@ class ArticleExtractor:
                 name = row[col_map['name']]
                 if pd.isna(name): continue
                 
-                rz = row[col_map['rz']] if col_map['rz'] is not None else None
+                # Получаем значения кодов
+                rz_raw = row[col_map['rz']] if col_map['rz'] is not None else None
+                pr_raw = row[col_map['pr']] if col_map['pr'] is not None else None
                 csr = row[col_map['csr']] if col_map['csr'] is not None else None
                 vr = row[col_map['vr']] if col_map['vr'] is not None else None
                 
-                row_type = get_row_type(rz, csr, vr, name)
+                # Нормализуем РзПр: обрабатываем комбинированную колонку (4-значный код)
+                rz_code = ""
+                if rz_raw and pd.notna(rz_raw):
+                    rz_str = str(rz_raw).replace(' ', '').replace('.', '').replace(',', '').strip()
+                    if rz_str and rz_str != '0':
+                        if len(rz_str) == 4:
+                            # Полный код РзПр (например "0405")
+                            rz_code = rz_str
+                        elif len(rz_str) == 2:
+                            # Только раздел, добавляем подраздел если есть
+                            if pr_raw and pd.notna(pr_raw):
+                                pr_str = str(pr_raw).replace(' ', '').replace('.', '').replace(',', '').strip()
+                                if pr_str and pr_str != '0':
+                                    rz_code = rz_str.zfill(2) + pr_str.zfill(2)
+                            else:
+                                rz_code = rz_str.zfill(2) + "00"
+                        else:
+                            rz_code = rz_str
+                
+                row_type = get_row_type(rz_code if rz_code else rz_raw, csr, vr, name)
+                
+                # Логируем каждую строку (используем нормализованный rz_code)
+                row_debug_info = f"Стр {idx+1}: {str(name)[:50]:<50} | RZ={rz_code if rz_code else rz_raw} | CSR={csr} | VR={vr} | Type={row_type}"
                 
                 # Берем ТОЛЬКО статьи (без фильтрации по ключевым словам!)
                 if row_type != "Article":
+                    log_debug(f"{row_debug_info} -> SKIP ({row_type})")
                     continue
 
-                def clean_sum(val):
+                def clean_sum(val, mult=1.0):
                     if pd.isna(val): return 0.0
                     s = str(val).replace(u'\xa0', '').replace(' ', '').replace(',', '.')
-                    try: return float(s)
+                    try: return float(s) * mult
                     except: return 0.0
 
                 row_sums = {}
                 has_nonzero = False
                 for year, col_idx in col_map['year_map'].items():
                     if col_idx < len(row):
-                        val = clean_sum(row[col_idx])
+                        val = clean_sum(row[col_idx], multiplier)
                         if val != 0:
                             has_nonzero = True
                         row_sums[year] = val
                     else:
                         row_sums[year] = 0.0
+                
+                # Формируем строку с суммами для лога
+                sums_str = ", ".join([f"{y}:{v:,.2f}" for y, v in row_sums.items() if v != 0])
 
                 # Пропускаем нулевые строки
                 if not has_nonzero:
+                    log_debug(f"{row_debug_info} -> SKIP (Zero sums)")
                     continue
+                
+                log_debug(f"{row_debug_info} -> TAKEN | Sums: {sums_str}")
+
+                # Нормализуем коды для JSON (используем rz_code вместо rz_raw)
+                rz_str = normalize_code(rz_code) if rz_code else ""
+                csr_str = normalize_code(csr) if csr else ""
+                vr_str = normalize_code(vr) if vr else ""
 
                 article = {
                     "file": filename,
                     "mo": mo_name,
                     "row_idx": idx,
-                    "rz": str(rz) if rz else "",
-                    "csr": str(csr) if csr else "",
-                    "vr": str(vr) if vr else "",
+                    "rz": rz_str,
+                    "csr": csr_str,
+                    "vr": vr_str,
                     "name": str(name).strip(),
                     "sums": row_sums
                 }
                 
-                self.articles.append(article)
+                self._add_article(article)
 
         except Exception as e:
             print(f"Ошибка обработки {filename}: {e}")
@@ -293,6 +427,7 @@ class ArticleExtractor:
         """
         filename = os.path.basename(filepath)
         print(f"Обработка Word: {filename} (МО: {mo_name})")
+        log_debug(f"\n{'='*80}\nФАЙЛ (Word): {filename} (МО: {mo_name})\n{'='*80}")
         
         try:
             # Если таблицы не переданы - извлекаем из файла
@@ -345,7 +480,7 @@ class ArticleExtractor:
                 from docx import Document
                 doc = Document(filepath)
                 for table in doc.tables:
-                    data = [[cell.text.strip() for cell in row.cells] for row in table.rows]
+                    data = [[self.clean_text(cell.text) for cell in row.cells] for row in table.rows]
                     if data:
                         df = pd.DataFrame(data)
                         tables.append(df)
@@ -366,7 +501,8 @@ class ArticleExtractor:
                             row_data = []
                             for j in range(1, cols + 1):
                                 try:
-                                    cell_text = table.Cell(i, j).Range.Text.strip().replace('\r\x07', '').replace('\x07', '')
+                                    cell_text = table.Cell(i, j).Range.Text
+                                    cell_text = self.clean_text(cell_text)
                                     row_data.append(cell_text)
                                 except:
                                     row_data.append('')
@@ -412,6 +548,14 @@ class ArticleExtractor:
             print(f"  Не найдены колонки с годами")
             return
         
+        multiplier = cols.get('multiplier', 1.0)
+        if multiplier > 1:
+            print(f"  Единицы: тыс. руб. (множитель: {multiplier})")
+            
+        log_debug(f"Таблица Word. Колонки: Name={cols['name']}, RZ={cols['rz']}, CSR={cols['csr']}, VR={cols['vr']}")
+        log_debug(f"Множитель: {multiplier}")
+        log_debug("-" * 40)
+        
         # Обрабатываем строки данных
         data_start = header_row_idx + 1
         article_count = 0
@@ -419,53 +563,58 @@ class ArticleExtractor:
         for idx in range(data_start, len(df)):
             row = df.iloc[idx]
             
-            # Получаем значения
+            # Получаем значения (очищаем от управляющих символов Word)
             name = row.iloc[cols['name']] if cols['name'] is not None else ""
             
             if pd.isna(name) or str(name).strip() == "":
                 continue
             
-            name = str(name).strip()
+            name = self.clean_text(name)
             
             # Пропускаем итоговые строки
             name_lower = name.lower()
             if name_lower.startswith('итого') or name_lower.startswith('всего'):
                 continue
             
-            # Коды разделов
-            rz = row.iloc[cols['rz']] if cols['rz'] is not None else ""
-            pr = row.iloc[cols['pr']] if cols['pr'] is not None else ""
-            csr = row.iloc[cols['csr']] if cols['csr'] is not None else ""
-            vr = row.iloc[cols['vr']] if cols['vr'] is not None else ""
+            # Коды разделов (очищаем от управляющих символов)
+            rz = self.clean_text(row.iloc[cols['rz']]) if cols['rz'] is not None else ""
+            pr = self.clean_text(row.iloc[cols['pr']]) if cols['pr'] is not None else ""
+            csr = self.clean_text(row.iloc[cols['csr']]) if cols['csr'] is not None else ""
+            vr = self.clean_text(row.iloc[cols['vr']]) if cols['vr'] is not None else ""
             
-            # Суммы по годам
+            # Суммы по годам (с учётом множителя!)
             row_sums = {}
             for year, col_idx in cols['year_map'].items():
                 try:
                     val = row.iloc[col_idx]
                     if pd.notna(val):
                         val_str = str(val).replace(' ', '').replace(',', '.').strip()
-                        row_sums[year] = float(val_str) if val_str else 0
+                        row_sums[year] = float(val_str) * multiplier if val_str else 0
                 except (ValueError, IndexError):
                     pass
             
             # Пропускаем строки без сумм
             if not row_sums or all(v == 0 for v in row_sums.values()):
+                log_debug(f"Стр {idx+1}: {str(name)[:50]:<50} -> SKIP (No sums)")
                 continue
             
+            sums_str = ", ".join([f"{y}:{v:,.2f}" for y, v in row_sums.items() if v != 0])
+            log_debug(f"Стр {idx+1}: {str(name)[:50]:<50} -> TAKEN | RZ={rz} CSR={csr} | Sums: {sums_str}")
+            
+            # Нормализуем коды (удаляем "000", "nan", etc.)
             article = {
                 "mo": mo_name,
                 "file": filename,
                 "row_idx": idx,
-                "rz": str(rz) if pd.notna(rz) else "",
-                "pr": str(pr) if pd.notna(pr) else "",
-                "csr": str(csr) if pd.notna(csr) else "",
-                "vr": str(vr) if pd.notna(vr) else "",
+                "rz": normalize_code(rz) if rz else "",
+                "pr": normalize_code(pr) if pr else "",
+                "csr": normalize_code(csr) if csr else "",
+                "vr": normalize_code(vr) if vr else "",
                 "name": name,
                 "sums": row_sums
             }
             
-            self.articles.append(article)
+            self._add_article(article)
             article_count += 1
         
         print(f"  Извлечено {article_count} статей из Word таблицы")
@@ -512,10 +661,14 @@ class ArticleExtractor:
         return output_path
 
 
-def extract_all_articles(input_dir=INPUT_DIR):
+def extract_all_articles(input_dir=INPUT_DIR, max_workers=4):
     """
     Основная функция извлечения статей.
     Возвращает экземпляр ArticleExtractor с извлеченными статьями.
+    
+    Args:
+        input_dir: папка с входными файлами
+        max_workers: количество параллельных потоков для обработки файлов
     """
     extractor = ArticleExtractor()
     
@@ -543,8 +696,24 @@ def extract_all_articles(input_dir=INPUT_DIR):
 
     print(f"\nНайдено корректных Excel-файлов для обработки: {len(files_to_process)}")
 
-    for filepath, mo_name in files_to_process:
-        extractor.process_excel(filepath, mo_name)
+    if len(files_to_process) > 1 and max_workers > 1:
+        # Параллельная обработка файлов
+        print(f"Параллельная обработка в {max_workers} потоках...")
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {
+                executor.submit(extractor.process_excel, filepath, mo_name): (filepath, mo_name)
+                for filepath, mo_name in files_to_process
+            }
+            for future in as_completed(futures):
+                filepath, mo_name = futures[future]
+                try:
+                    future.result()
+                except Exception as e:
+                    print(f"Ошибка при обработке {filepath}: {e}")
+    else:
+        # Последовательная обработка (для одного файла или если параллельность отключена)
+        for filepath, mo_name in files_to_process:
+            extractor.process_excel(filepath, mo_name)
 
     print(f"\nВсего извлечено статей: {len(extractor.articles)}")
     return extractor

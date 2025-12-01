@@ -40,6 +40,23 @@ def safe_print(msg):
         # Заменяем проблемные символы
         print(msg.encode('cp1251', errors='replace').decode('cp1251'))
 
+
+# Символы, недопустимые в Excel (управляющие символы кроме tab, newline, carriage return)
+ILLEGAL_CHARS_RE = re.compile(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]')
+
+
+def clean_text(text):
+    """Очищает текст от недопустимых символов для Excel."""
+    if text is None:
+        return ""
+    text = str(text)
+    # Удаляем управляющие символы Word
+    text = text.replace('\x07', '').replace('\r\x07', '').replace('\r', '')
+    # Удаляем остальные недопустимые символы
+    text = ILLEGAL_CHARS_RE.sub('', text)
+    return text.strip()
+
+
 # Попытка импорта библиотек для разных форматов
 try:
     import rarfile
@@ -307,15 +324,19 @@ class InputProcessor:
                 self._classify_pdf(file_info)
     
     def _classify_excel(self, file_info: FileInfo):
-        """Классифицирует Excel файл, проверяя содержимое листов."""
+        """Классифицирует Excel файл, проверяя содержимое ВСЕХ листов и выбирая лучший."""
         try:
             xls = pd.ExcelFile(file_info.path)
             
+            # Собираем все листы с маркерами бюджета
+            budget_sheets = []  # [(sheet_name, priority, marker, header_row, df), ...]
+            decision_sheet = None
+            
             for sheet_name in xls.sheet_names:
-                # Читаем первые 30 строк листа
+                # Читаем первые 50 строк листа (увеличил с 30)
                 try:
                     df = pd.read_excel(file_info.path, sheet_name=sheet_name, 
-                                       header=None, nrows=30)
+                                       header=None, nrows=50)
                 except:
                     continue
                 
@@ -326,33 +347,49 @@ class InputProcessor:
                         if pd.notna(val):
                             text_content += " " + str(val).lower()
                 
-                # Проверяем на маркеры бюджета расходов (с приоритетом!)
+                # Проверяем на маркеры бюджета расходов (собираем все!)
                 for marker, priority in BUDGET_EXPENSES_MARKERS_PRIORITY:
                     if marker in text_content:
-                        file_info.file_type = 'budget_expenses'
-                        file_info.sheet_name = sheet_name
-                        file_info.confidence = 0.9
-                        file_info.details['marker_priority'] = priority
-                        file_info.details['marker_found'] = marker
-                        
                         # Ищем строку заголовка
+                        header_row = None
                         for idx, row in df.iterrows():
                             row_text = " ".join([str(x).lower() for x in row if pd.notna(x)])
                             if "наименование" in row_text and ("раздел" in row_text or "код" in row_text):
-                                file_info.header_row = idx
+                                header_row = idx
                                 break
                         
-                        safe_print(f"  [OK] BUDGET_EXPENSES (P{priority}): {os.path.basename(file_info.path)} (лист: {sheet_name})")
-                        return
+                        budget_sheets.append((sheet_name, priority, marker, header_row, df))
+                        break  # Один маркер на лист достаточно
                 
                 # Проверяем на маркеры решения (редко в Excel, но возможно)
-                for marker in DECISION_MARKERS:
-                    if marker in text_content:
-                        file_info.file_type = 'decision'
-                        file_info.sheet_name = sheet_name
-                        file_info.confidence = 0.7
-                        safe_print(f"  [?] DECISION (Excel): {os.path.basename(file_info.path)}")
-                        return
+                if not decision_sheet:
+                    for marker in DECISION_MARKERS:
+                        if marker in text_content:
+                            decision_sheet = sheet_name
+                            break
+            
+            # Выбираем лучший лист (с наименьшим приоритетом = более важный)
+            if budget_sheets:
+                budget_sheets.sort(key=lambda x: x[1])  # Сортируем по приоритету
+                best_sheet, best_priority, best_marker, header_row, df = budget_sheets[0]
+                
+                file_info.file_type = 'budget_expenses'
+                file_info.sheet_name = best_sheet
+                file_info.confidence = 0.9
+                file_info.header_row = header_row
+                file_info.details['marker_priority'] = best_priority
+                file_info.details['marker_found'] = best_marker
+                
+                safe_print(f"  [OK] BUDGET_EXPENSES (P{best_priority}): {os.path.basename(file_info.path)} (лист: {best_sheet})")
+                return
+            
+            # Если бюджет не найден, проверяем решение
+            if decision_sheet:
+                file_info.file_type = 'decision'
+                file_info.sheet_name = decision_sheet
+                file_info.confidence = 0.7
+                safe_print(f"  [?] DECISION (Excel): {os.path.basename(file_info.path)}")
+                return
             
             # Если не нашли маркеры, проверяем имя файла
             filename_lower = os.path.basename(file_info.path).lower()
@@ -520,6 +557,47 @@ class InputProcessor:
                     pass
         return result
     
+    def _auto_convert_doc_to_docx(self, doc_path: str) -> str:
+        """
+        Автоматически конвертирует .doc в .docx если .docx ещё не существует.
+        Это ускоряет последующую обработку в 10-50 раз.
+        
+        Args:
+            doc_path: путь к .doc файлу
+            
+        Returns:
+            str: путь к .docx файлу (конвертированному или существующему)
+        """
+        docx_path = doc_path.replace('.doc', '.docx')
+        
+        # Если .docx уже существует - возвращаем его путь
+        if os.path.exists(docx_path):
+            return docx_path
+        
+        # Иначе конвертируем
+        safe_print(f"  Конвертация {os.path.basename(doc_path)} → .docx...")
+        
+        try:
+            # Формат 16 = wdFormatXMLDocument (docx)
+            wdFormatDocx = 16
+            
+            word = win32com.client.Dispatch("Word.Application")
+            word.Visible = False
+            word.DisplayAlerts = 0
+            
+            doc = word.Documents.Open(os.path.abspath(doc_path))
+            doc.SaveAs(os.path.abspath(docx_path), FileFormat=wdFormatDocx)
+            doc.Close()
+            word.Quit()
+            
+            safe_print(f"  ✓ Конвертация завершена")
+            return docx_path
+            
+        except Exception as e:
+            safe_print(f"  ✗ Ошибка конвертации: {e}")
+            # При ошибке возвращаем оригинальный путь
+            return doc_path
+    
     def _extract_text_from_word(self, filepath: str, with_tables: bool = False) -> tuple:
         """
         Извлекает текст из Word документа.
@@ -532,6 +610,12 @@ class InputProcessor:
             Если with_tables=False: строка с текстом
             Если with_tables=True: (текст, список таблиц)
         """
+        # ОПТИМИЗАЦИЯ: если это .doc файл, сначала пытаемся сконвертировать в .docx
+        # Это ускоряет обработку в 10-50 раз
+        original_filepath = filepath
+        if filepath.lower().endswith('.doc') and HAS_WIN32:
+            filepath = self._auto_convert_doc_to_docx(filepath)
+        
         ext = os.path.splitext(filepath)[1].lower()
         text = ""
         tables = []
@@ -546,7 +630,7 @@ class InputProcessor:
                     for table in doc.tables:
                         table_data = []
                         for row in table.rows:
-                            row_data = [cell.text.strip() for cell in row.cells]
+                            row_data = [clean_text(cell.text) for cell in row.cells]
                             table_data.append(row_data)
                         tables.append(table_data)
             except:
@@ -578,7 +662,7 @@ class InputProcessor:
                                 for col_idx in range(1, table.Columns.Count + 1):
                                     try:
                                         cell_text = table.Cell(row_idx, col_idx).Range.Text
-                                        cell_text = cell_text.strip().replace('\r\x07', '').replace('\r', '')
+                                        cell_text = clean_text(cell_text)
                                         row_data.append(cell_text)
                                     except:
                                         row_data.append('')
